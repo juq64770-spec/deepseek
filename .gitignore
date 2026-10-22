@@ -67,3 +67,11 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+
+# 本地语音转文字（whisper.cpp 二进制 + 模型，体积数百 MB，不入库）
+tools/whisper/
+
+# 本地生成的表情包底图/成品与语音样张（个人素材 + 体积大，不入库）
+tools/stickers/pack/
+tools/stickers/samples/
+tools/tts/samples/

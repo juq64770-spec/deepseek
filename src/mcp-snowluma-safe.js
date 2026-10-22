@@ -325,10 +325,14 @@ const TOOL_CONFIG_FLAGS = {
   qq_memory_query: 'memory',
   qq_memory_remove: 'memory',
   qq_memory_clear: 'memory',
+  qq_diary_write: 'diary',
+  qq_diary_recent: 'diary',
+  qq_now_playing: 'nowPlaying',
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
   qq_list_voices: 'sendVoice',
+  qq_speak: 'speak',
   // 下面这些曾经漏登记。漏一个不是"多注册一个工具"那么轻：桥接那边按 `v2ToolEnabled(flag)`
   // 在**调用期**一律 403，而这里不登记就等于"控制台显示已关闭、模型每次请求仍收到它的完整
   // 描述与参数 schema，然后调用它、再拿到 403"——既白烧 token（本文件开头 176 行起就是为省这份
@@ -965,6 +969,68 @@ server.tool(
 );
 
 server.tool(
+  'qq_diary_write',
+  '写一条自己的日记（只追加，不能改也不能删）。只写你此刻真的在想的事、具体的小事，一两句就够；不要写“今天真充实”这类总结，不要写汇报，不要为了打卡每天写。一天最多几条由配置决定，超了会被拒绝。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    content: z.string().describe('日记正文，一两句，最多约 300 字；不要换行堆小作文'),
+    mood: z.string().optional().describe('可选：此刻的心情/标签，几个字即可（如 还行、烦、开心）')
+  },
+  async ({ key, token, content, mood }) => {
+    try {
+      const data = await agentApi('/api/socialV2/diary-append', {
+        method: 'POST',
+        body: JSON.stringify({ key, content, mood: mood || '' }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `写日记失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_diary_recent',
+  '看看自己最近写过的日记（只读，最新的一条在最前面），可按关键词搜索。想接回以前的念头时偶尔翻一翻，不用每轮都看。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    limit: z.number().int().min(1).max(20).optional().describe('返回条数，默认 5'),
+    query: z.string().optional().describe('可选：按关键词过滤（搜正文和心情）')
+  },
+  async ({ key, token, limit, query }) => {
+    try {
+      const q = new URLSearchParams({ key });
+      if (limit) q.set('limit', String(limit));
+      if (query) q.set('query', query);
+      const data = await agentApi(`/api/socialV2/diary?${q.toString()}`, { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `读日记失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_now_playing',
+  '看看本机此刻正在播放的歌（歌名/歌手/专辑/播放状态/进度，只读）。网易云优先，没开时退回系统当前媒体会话；没装/没在播会明确告诉你。只在聊到音乐、被问“你在听什么”、或想接歌词时偶尔查一次，别每轮都查；群聊里不要主动公开管理员在听什么。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+  },
+  async ({ key, token }) => {
+    try {
+      const data = await agentApi(`/api/socialV2/now-playing?key=${encodeURIComponent(key)}`, { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `读取播放状态失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
   'qq_slang_query',
   '查看当前已确认的群聊黑话/梗/网络表达（只读）。返回已确认词条列表和格式化黑话表；遇到不熟悉的词可先查这里，再决定是否搜索/使用。',
   {
@@ -1209,6 +1275,45 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `获取语音库失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tts?.enabled === true && cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.speak !== false) {
+  server.tool(
+    'qq_speak',
+    '把一段文字合成语音条发出去（TTS，本机合成微软神经语音）。注意：① 只在**对方先发语音**时用它回语音；对方打字你就打字，不要用它；② 内容要短、口语化，一两句就够，别念长文/列表/代码；③ 受语音频率上限约束，超限会被拒绝，别连发；④ 返回的 verified=true 表示已回读到这条消息的 record 段（语音确实落地了）—— 只有 verified=true 才能对用户说你说了语音；⑤ 合成需要一点时间（几秒），发完不要再重复发同样的内容。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      text: z.string().describe('要说的内容（会被清洗并截断到字数上限，口语短句即可）'),
+      label: z.string().optional().describe('可选：写进会话记录里的说明'),
+      rate: z.string().optional().describe('可选：语速 +N% 或 -N%（默认走配置）'),
+      volume: z.string().optional().describe('可选：音量 +N% 或 -N%（默认走配置）'),
+      pitch: z.string().optional().describe('可选：音调 +NHz 或 -NHz（默认走配置）'),
+      verify: z.boolean().optional().describe('是否回读校验语音已落地（默认 true，建议保持开启）')
+    },
+    async ({ key, token, text, label, rate, volume, pitch, verify }) => {
+      try {
+        const data = await agentApi('/api/socialV2/speak', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            text: String(text ?? ''),
+            label: label || '',
+            rate: rate || '',
+            volume: volume || '',
+            pitch: pitch || '',
+            verify: verify !== false,
+            token
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 300000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `语音合成发送失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

@@ -31,12 +31,12 @@ check('新配置 {prefix} 通过（个人前缀）', () => {
   if (v.prefix.length === 0) throw new Error('prefix 为空');
 });
 
-check('新配置 {prefix, suffix} 通过（含 {{cwd}} 模板）', () => {
+check('新配置 {prefix, suffix} 通过（suffix 允许静态文本）', () => {
   const v = persona.Config({
     prefix: 'You are a coding agent powered by the {{model}} model.',
-    suffix: 'Your working directory is {{cwd}}.',
+    suffix: 'Always answer in Chinese.',
   });
-  if (v.suffix !== 'Your working directory is {{cwd}}.') throw new Error('suffix 未保留');
+  if (v.suffix !== 'Always answer in Chinese.') throw new Error('suffix 未保留');
   if (v.complete !== false) throw new Error('complete 默认值异常');
   if (v.includeRuntimeContext !== true) throw new Error('includeRuntimeContext 默认值异常');
 });
@@ -58,8 +58,15 @@ for (const preset of ['qq-chat', 'qq-chat-v2']) {
   check('保留了 {{model}} 变量', () => {
     if (!/\{\{model\}\}/.test(row.config.prefix)) throw new Error('prefix 缺少 {{model}}');
   });
-  check('保留了 {{cwd}} 变量', () => {
-    if (!/\{\{cwd\}\}/.test(row.config.suffix ?? '')) throw new Error('suffix 缺少 {{cwd}}');
+  check('只使用 DSH 已注册的提示词变量（{{model}} / {{provider}}）', () => {
+    // DSH 0.2.0-rc.2 只注册 provider / model；出现其它变量会让装配直接报
+    // unknown prompt variable，整轮 agent 失败（QQ 上表现为完全不回话）。
+    const used = `${row.config.prefix ?? ''}\n${row.config.suffix ?? ''}`.match(/\{\{[a-zA-Z0-9_-]+\}\}/g) ?? [];
+    const unknown = [...new Set(used)].filter((v) => !['{{model}}', '{{provider}}'].includes(v));
+    if (unknown.length) throw new Error(`出现未注册变量：${unknown.join(', ')}`);
+  });
+  check('不再包含未注册的 {{cwd}} 变量', () => {
+    if (/\{\{cwd\}\}/.test(`${row.config.prefix ?? ''}\n${row.config.suffix ?? ''}`)) throw new Error('仍含 {{cwd}}');
   });
   check('不再包含已废弃的 text 字段', () => {
     if (Object.hasOwn(row.config, 'text')) throw new Error('仍有 text 字段');

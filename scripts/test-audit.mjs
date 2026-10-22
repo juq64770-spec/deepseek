@@ -41,6 +41,10 @@ const tests = [
   'test-voice-edge.mjs',
   // 语音图形界面（参数解析/鉴权/路径穿越/文件名净化；live 段需普通终端）
   'test-voice-gui.mjs',
+  // 进阶内容：她的日记（JSONL 追加/每日上限/路径约束）与本机听歌状态（SMTC 解析）
+  'test-diary.mjs', 'test-now-playing.mjs',
+  // 本地语音转文字：WAV 归一化（重采样/混声道）与 whisper 输出解析（不调用真实 QQ）
+  'test-stt.mjs',
   // 控制台静态契约（跑不了 Playwright 的环境下的替代回归）
   'test-console-static.mjs',
   // 语音系统整体结构检查（入口/依赖/端点/开关/文档一致性）

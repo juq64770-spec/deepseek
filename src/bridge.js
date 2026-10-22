@@ -26,6 +26,10 @@ import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, in
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
+import { appendDiaryEntry, formatDiaryEntries, loadDiaryEntries, recentDiaryEntries, resolveDiaryFile } from './diary-lib.js';
+import { readNowPlaying } from './music-lib.js';
+import { STT_DEFAULT_BINARY, STT_DEFAULT_MODEL, transcribeWavBuffer, wavDurationSec } from './stt-lib.js';
+import { TTS_DEFAULT_VOICE, TTS_DEFAULT_RATE, TTS_DEFAULT_VOLUME, TTS_DEFAULT_PITCH, TTS_MAX_CHARS, sanitizeTtsText, synthesizeTextToFile, cleanupTtsTemp } from './tts-lib.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import {
@@ -778,7 +782,9 @@ function loadConfig() {
         setStickerRemark: false,
         stickerNote: true,
         collectSticker: true,
-        getSelfImage: true
+        getSelfImage: true,
+        diary: true,
+        nowPlaying: true
       },
       wake: {
         defaultMode: 'diving',
@@ -845,6 +851,53 @@ function loadConfig() {
         idleThresholdMs: 15 * 60 * 1000,
         probability: 0.3
       },
+      // 她自己的日记：一条一行 JSONL，只追加、不提供删除/改写工具。
+      // 文件路径必须是仓库内的相对路径（默认 state/diary/，已被 .gitignore 排除）。
+      diary: {
+        enabled: true,
+        file: 'state/diary/diary.jsonl',
+        maxChars: 300,       // 单条正文上限
+        maxPerDay: 3,        // 每天最多几条（0 = 不限制）
+        recentDefault: 5,    // qq_diary_recent 默认返回条数
+        recentMax: 20        // qq_diary_recent 单次上限
+      },
+      // 听歌：读取本机当前播放状态（SMTC，只读）。cacheTtlMs 内重复查询复用结果，
+      // 避免每次唤醒都启动一次 PowerShell。
+      music: {
+        enabled: true,
+        cacheTtlMs: 5000,
+        timeoutMs: 8000
+      },
+      // 本地语音转文字（Whisper）：QQ 语音 → SnowLuma 解 SILK 成 WAV → 本机 whisper-cli。
+      // 二进制与模型体积大，放在 tools/whisper/（已被 .gitignore 排除），不进仓库。
+      // 全程本地，音频不上传任何服务器。
+      stt: {
+        enabled: true,
+        binaryPath: STT_DEFAULT_BINARY,
+        modelPath: STT_DEFAULT_MODEL,
+        language: 'zh',
+        threads: 4,
+        timeoutMs: 60000,
+        maxSeconds: 120,                  // 单条语音最长转写时长；超过就跳过
+        maxBytes: 20 * 1024 * 1024,       // 转码后的 WAV 上限
+        maxPerMessage: 2,                 // 一条消息里最多转几条语音
+        maxPerMinute: 4                   // 全局每分钟最多转几条，防止语音刷屏占满 CPU
+      },
+      // 语音合成（TTS，edge-tts）：AI 用 qq_speak 把一段文字合成语音发出去。
+      // 输出 mp3 交给 SnowLuma 转 SILK，本机不需要 ffmpeg。合成需要联网访问微软
+      // 语音服务；本机直连不通时用 proxy（默认留空，config.json 按机器情况填）。
+      // enabled 默认 false（语音是「开口说话」的强表达，需要显式打开）。
+      tts: {
+        enabled: false,
+        voice: TTS_DEFAULT_VOICE,
+        rate: TTS_DEFAULT_RATE,
+        volume: TTS_DEFAULT_VOLUME,
+        pitch: TTS_DEFAULT_PITCH,
+        edgeTtsCmd: 'edge-tts',
+        proxy: '',
+        maxChars: TTS_MAX_CHARS,
+        timeoutMs: 60000
+      },
       feedback: {
         maxLength: 500,
         notifyOwnerOnError: false
@@ -904,7 +957,10 @@ function loadConfig() {
     stickerNote: true,
     collectSticker: true,
     getSelfImage: true,
+    diary: true,
+    nowPlaying: true,
     sendVoice: false,
+    speak: false,
     ...(cfg.socialV2.tools ?? {})
   };
 
@@ -1228,11 +1284,13 @@ function withTimeout(promise, ms, label) {
 }
 
 async function segmentsToText(segments, options = {}) {
-  const { resolveAtName, resolveReply, includeReply = true } = options ?? {};
+  const { resolveAtName, resolveReply, includeReply = true, voiceTranscripts } = options ?? {};
   // 有些 OneBot 实现直接把纯文本消息放在 message 字段里（string）
   if (typeof segments === 'string') return segments.trim();
   const out = [];
+  let segIndex = -1;
   for (const seg of segments ?? []) {
+    segIndex += 1;
     const d = seg?.data ?? {};
     switch (seg?.type) {
       case 'text': out.push(d.text ?? ''); break;
@@ -1251,7 +1309,13 @@ async function segmentsToText(segments, options = {}) {
       // 市场表情（mface）在部分网关实现里出现：有 summary 就用它，别让模型只看到 "[mface]"。
       case 'mface': out.push(`[表情${d.summary ? `:${d.summary}` : ''}]`); break;
       case 'image': out.push('[图片]'); break;
-      case 'record': out.push('[语音]'); break;
+      case 'record': {
+        // 转写成功的语音带【语音】标记：模型由此知道「对方是用语音说的」，
+        // 可以按规矩用 qq_speak 回语音。没转写成功时退化为 [语音] 占位。
+        const vt = voiceTranscripts?.get(segIndex);
+        out.push(vt ? `【语音】${vt}` : '[语音]');
+        break;
+      }
       case 'video': out.push('[视频]'); break;
       case 'file': out.push(`[文件${d.name ?? ''}]`); break;
       case 'reply': {
@@ -1526,6 +1590,22 @@ async function main() {
       loudness: v.loudness || 'normal',
       ffmpegPath: process.env.FFMPEG_PATH || v.ffmpegPath || null,
       autoReadback: v.autoReadback !== false
+    };
+  }
+
+  // TTS 配置读取：enabled 是显式开启（默认 false），其余字段带兜底与归一化。
+  function ttsCfg() {
+    const t = cfg.socialV2?.tts ?? {};
+    return {
+      enabled: t.enabled === true,
+      voice: String(t.voice ?? TTS_DEFAULT_VOICE).trim() || TTS_DEFAULT_VOICE,
+      rate: String(t.rate ?? TTS_DEFAULT_RATE).trim() || TTS_DEFAULT_RATE,
+      volume: String(t.volume ?? TTS_DEFAULT_VOLUME).trim() || TTS_DEFAULT_VOLUME,
+      pitch: String(t.pitch ?? TTS_DEFAULT_PITCH).trim() || TTS_DEFAULT_PITCH,
+      edgeTtsCmd: String(t.edgeTtsCmd ?? 'edge-tts').trim() || 'edge-tts',
+      proxy: t.proxy ? String(t.proxy).trim() : '',
+      maxChars: Number(t.maxChars) > 0 ? Math.min(Math.floor(Number(t.maxChars)), 500) : TTS_MAX_CHARS,
+      timeoutMs: Number(t.timeoutMs) > 0 ? Number(t.timeoutMs) : 60000
     };
   }
 
@@ -1867,6 +1947,41 @@ async function main() {
     const wantVerify = verify === true || (verify !== false && vc.autoReadback);
     const verification = wantVerify ? await verifyVoiceMessageSent(sent.messageId) : null;
     return { ...sent, key, file: resolved.path, via: resolved.via, verification, readback: readbackText };
+  }
+
+  // TTS 语音回复：文字 → edge-tts 合成临时 mp3 → sendVoiceV2 发送 → 删除临时文件。
+  // 复用语音额度（voiceBudgetCheck/Commit），TTS 不会绕过语音的频率上限；
+  // 合成失败/发送失败都会在 finally 里清理临时文件，不会在系统临时目录里堆积。
+  async function sendSpeakV2(key, text, { label = '', verify = null, rate = null, volume = null, pitch = null } = {}) {
+    const vc = voiceCfg();
+    const tc = ttsCfg();
+    if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
+    if (!tc.enabled) throw new Error('TTS 合成已关闭（socialV2.tts.enabled=false）');
+    const clean = sanitizeTtsText(text, tc.maxChars);
+    if (!clean) throw new Error('要说的内容为空（qq_speak 的 text 不能为空）');
+    voiceBudgetCheck(key, vc);
+    const synth = await synthesizeTextToFile(clean, {
+      voice: tc.voice,
+      rate: rate ? String(rate).trim() : tc.rate,
+      volume: volume ? String(volume).trim() : tc.volume,
+      pitch: pitch ? String(pitch).trim() : tc.pitch,
+      edgeTtsCmd: tc.edgeTtsCmd,
+      proxy: tc.proxy || null,
+      timeoutMs: tc.timeoutMs
+    });
+    try {
+      // audio: null → 音量走 voice 默认（1 倍原样，不产生临时文件，也不需要本机 ffmpeg）
+      const sent = await sendVoiceV2(key, synth.path, { guard: true, audit: true, audio: null });
+      voiceBudgetCommit(key);
+      recordVoiceSentV2(key, sent, label || `speak:${clean.slice(0, 40)}`);
+      log(`[tts] ${key} 已语音说出「${clean.slice(0, 60)}」(${sent.detail}, messageId=${sent.messageId ?? '?'})`);
+      appendActivity(`${key} [tts] 语音说出「${clean.slice(0, 60)}」(${sent.detail})`);
+      const wantVerify = verify === true || (verify !== false && vc.autoReadback);
+      const verification = wantVerify && sent.messageId ? await verifyVoiceMessageSent(sent.messageId) : null;
+      return { ...sent, text: clean, voice: synth.voice, bytes: synth.bytes, verification };
+    } finally {
+      cleanupTtsTemp(synth.path);
+    }
   }
 
   // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
@@ -3075,6 +3190,10 @@ async function main() {
   function v2ToolEnabled(flag) {
     return cfg.socialV2?.tools?.[flag] !== false;
   }
+
+  // 「听歌」读取结果缓存。每次查询都要启动一次 PowerShell（几百毫秒），
+  // 而同一轮里连续问两次、或者两轮之间只隔几秒都很常见，没必要重复拉起进程。
+  let nowPlayingCache = { at: 0, value: null };
 
   function startConsoleServer() {
     const port = cfg.consolePort ?? 3100;
@@ -4374,7 +4493,7 @@ async function main() {
           const current = fileV2 ?? ((cfg.socialV2 && typeof cfg.socialV2 === 'object') ? cfg.socialV2 : {});
           const merged = { ...current, ...body };
           // 子对象必须是非 null 对象；null/数组/基本类型会覆盖默认值导致工具开关被绕过，这里直接保留当前值。
-          for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context']) {
+          for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context', 'voice', 'tts', 'diary', 'music', 'stt', 'media']) {
             if (body[sub] !== undefined && (body[sub] === null || typeof body[sub] !== 'object' || Array.isArray(body[sub]))) {
               merged[sub] = current[sub] ?? {};
             }
@@ -4384,7 +4503,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'speak'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4646,7 +4765,8 @@ async function main() {
             stickerNote: 'qq_sticker_note',
             collectSticker: 'qq_collect_sticker',
             getSelfImage: 'qq_get_self_image',
-            sendVoice: 'qq_send_voice / qq_list_voices'
+            sendVoice: 'qq_send_voice / qq_list_voices',
+            speak: 'qq_speak'
           };
           const tools = cfg.socialV2?.tools ?? {};
           const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker']);
@@ -5680,6 +5800,53 @@ async function main() {
           return;
         }
 
+        // ── TTS 语音回复（qq_speak）：文字 → 本地合成 → 发语音条 ───────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/speak') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? body.target ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('speak')) { sendJson({ ok: false, error: '工具未启用：qq_speak' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          try {
+            const sent = await sendSpeakV2(key, String(body.text ?? ''), {
+              label: body.label ? String(body.label).slice(0, 100) : '',
+              verify: body.verify,
+              rate: body.rate,
+              volume: body.volume,
+              pitch: body.pitch
+            });
+            sendJson({
+              ok: true,
+              key,
+              messageId: sent.messageId,
+              text: sent.text,
+              voice: sent.voice,
+              bytes: sent.bytes,
+              detail: sent.detail,
+              // verified=true 表示已用 get_msg 回读到这条消息的 record 段
+              verified: sent.verification?.confirmed === true,
+              warnings: sent.warnings
+            });
+          } catch (error) {
+            // 失败路径无需回滚额度（voiceBudgetCommit 只在真正发出后记账）；合成临时文件已在 sendSpeakV2 内清理。
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-sticker') {
           if (!stickerEnabled()) { sendJson({ ok: false, error: '表情包体系已关闭' }, 403); return; }
           const body = await readBody();
@@ -6641,6 +6808,82 @@ async function main() {
           sendJson({ ok: true, key, category: category || 'all', memory: formatMemoryV2(st) });
           return;
         }
+        // ── 她的日记（reserved2）：只追加、只读最近几条 ────────────────────
+        // 设计见 src/diary-lib.js：一行一条 JSONL，不提供删除/改写，避免“日记”变成任务清单。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/diary-append') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (cfg.socialV2?.diary?.enabled === false) { sendJson({ ok: false, error: '日记功能已关闭（socialV2.diary.enabled=false）' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('diary')) { sendJson({ ok: false, error: '工具未启用：qq_diary_write' }, 403); return; }
+          let file;
+          try { file = resolveDiaryFile(ROOT, cfg.socialV2?.diary?.file); }
+          catch (error) { sendJson({ ok: false, error: String(error?.message ?? error) }, 500); return; }
+          try {
+            const result = appendDiaryEntry(file, {
+              content: body.content,
+              mood: body.mood,
+              maxChars: cfg.socialV2?.diary?.maxChars,
+              maxPerDay: cfg.socialV2?.diary?.maxPerDay
+            });
+            if (!result.ok) {
+              sendJson({ ok: false, error: result.error, todayCount: result.todayCount, maxPerDay: result.maxPerDay }, 409);
+              return;
+            }
+            log(`[diary] ${key} 写了一条日记（今天第 ${result.todayCount} 条${result.maxPerDay > 0 ? ` / 上限 ${result.maxPerDay}` : ''}）`);
+            sendJson({ ok: true, key, ...result });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/diary') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (cfg.socialV2?.diary?.enabled === false) { sendJson({ ok: false, error: '日记功能已关闭（socialV2.diary.enabled=false）' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('diary')) { sendJson({ ok: false, error: '工具未启用：qq_diary_recent' }, 403); return; }
+          const diaryCfg = cfg.socialV2?.diary ?? {};
+          const limitRaw = Number(url.searchParams.get('limit'));
+          const limitMax = Math.max(1, Math.min(50, Number(diaryCfg.recentMax) || 20));
+          const limit = Math.max(1, Math.min(limitMax, Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : (Number(diaryCfg.recentDefault) || 5)));
+          const query = String(url.searchParams.get('query') ?? '').trim().slice(0, 50);
+          try {
+            const entries = loadDiaryEntries(resolveDiaryFile(ROOT, diaryCfg.file));
+            const result = recentDiaryEntries(entries, { limit, query });
+            sendJson({ ok: true, key, limit, query, ...result, text: formatDiaryEntries(result) });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+        // ── 听歌：本机当前播放状态（只读，SMTC）───────────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/now-playing') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (cfg.socialV2?.music?.enabled === false) { sendJson({ ok: false, error: '听歌功能已关闭（socialV2.music.enabled=false）' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('nowPlaying')) { sendJson({ ok: false, error: '工具未启用：qq_now_playing' }, 403); return; }
+          try {
+            const ttl = Math.max(0, Number(cfg.socialV2?.music?.cacheTtlMs) || 0);
+            const stamp = Date.now();
+            if (!nowPlayingCache.value || stamp - nowPlayingCache.at > ttl) {
+              nowPlayingCache = { at: stamp, value: await readNowPlaying({ timeoutMs: cfg.socialV2?.music?.timeoutMs }) };
+            }
+            const playing = nowPlayingCache.value;
+            const textLine = playing?.ok
+              ? `正在播放：${playing.title}${playing.artist ? ` - ${playing.artist}` : ''}${playing.status && playing.status !== 'PLAYING' ? `（${playing.status}）` : ''}${playing.source === 'window-title' ? '（窗口标题兜底，没有进度）' : ''}`
+              : '当前没有检测到正在播放的歌';
+            sendJson({ ok: true, key, playing, text: textLine });
+          } catch (error) {
+            sendJson({ ok: false, error: `读取播放状态失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
         // ── 二代黑话学习（reserved2）：AI 查询/提交黑话候选 ─────────────────
         if (req.method === 'GET' && url.pathname === '/api/socialV2/slang/query') {
           const key = String(url.searchParams.get('key') ?? '').trim();
@@ -7345,6 +7588,159 @@ async function main() {
       throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
     }
     return body.data;
+  }
+
+  // 通用 OneBot 动作调用（目前只用于 get_record 拿语音字节；只读动作，不做写操作）。
+  async function snowlumaAction(action, params, { timeoutMs = 15000 } = {}) {
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    const res = await fetch(`${httpUrl}/${action}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+      },
+      body: JSON.stringify(params),
+      signal: AbortSignal.timeout(Math.max(1000, Number(timeoutMs) || 15000))
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+      throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}`);
+    }
+    return body.data;
+  }
+
+  // ── 本地语音转文字（Whisper）───────────────────────────────────────────
+  // 全链路本地：QQ 语音 → SnowLuma 用自带 ffmpeg 解 SILK 成 WAV(base64)
+  //            → 本模块转 16k 单声道 → whisper-cli 识别。
+  // 转写结果替换消息里的 [语音]（显示为 [语音：…]），失败则保持 [语音]。
+  const sttCache = new Map();   // 语音文件 ref → 文本（同一条语音只转一次）
+  let sttQueue = Promise.resolve();
+  let sttTimes = [];
+  let sttMissingWarned = false;
+
+  function repoPathInsideRoot(configured, fallback) {
+    const raw = String(configured ?? '').trim() || fallback;
+    const abs = path.resolve(ROOT, raw);
+    const rel = path.relative(ROOT, abs);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`路径必须是仓库内的相对路径：${raw}`);
+    }
+    return abs;
+  }
+
+  async function transcribeOneRecord(seg) {
+    const stt = cfg.socialV2?.stt ?? {};
+    if (stt.enabled === false) return '';
+    const d = seg?.data ?? {};
+    const ref = String(d.file || d.file_id || d.url || '').trim();
+    if (!ref) return '';
+    if (sttCache.has(ref)) return sttCache.get(ref);
+
+    // 频率限制：语音刷屏时保护 CPU。缓存命中不受限（同一句只转一次）。
+    const now = Date.now();
+    const perMinute = Math.max(1, Number(stt.maxPerMinute) || 4);
+    sttTimes = sttTimes.filter((t) => now - t < 60000);
+    if (sttTimes.length >= perMinute) {
+      log(`[stt] 本分钟语音转写次数已达上限（${perMinute}），跳过一条`);
+      return '';
+    }
+
+    let binary;
+    let model;
+    try {
+      binary = repoPathInsideRoot(stt.binaryPath, STT_DEFAULT_BINARY);
+      model = repoPathInsideRoot(stt.modelPath, STT_DEFAULT_MODEL);
+    } catch (error) {
+      if (!sttMissingWarned) { sttMissingWarned = true; log(`[stt] 路径配置无效：${error?.message ?? error}`); }
+      return '';
+    }
+    if (!fs.existsSync(binary) || !fs.existsSync(model)) {
+      // 配置默认指向 small；如果 small 还没下载完，但 base 在位，就先用 base 顶上，
+      // 避免“语音功能因为模型没下完而完全不可用”。两者都没有才真正跳过。
+      if (fs.existsSync(binary) && !fs.existsSync(model)) {
+        const fallbackModel = path.join(path.dirname(model), 'ggml-base.bin');
+        if (fs.existsSync(fallbackModel)) {
+          model = fallbackModel;
+          if (!sttMissingWarned) {
+            sttMissingWarned = true;
+            log('[stt] 配置的模型不存在，已回退到 ggml-base.bin');
+          }
+        }
+      }
+    }
+    if (!fs.existsSync(binary) || !fs.existsSync(model)) {
+      if (!sttMissingWarned) {
+        sttMissingWarned = true;
+        log('[stt] 未找到 whisper 程序或模型（tools/whisper/），语音先按 [语音] 处理');
+      }
+      return '';
+    }
+
+    sttTimes.push(now);
+    const started = Date.now();
+    const info = await snowlumaAction('get_record', { file: ref, out_format: 'wav' }, { timeoutMs: 30000 });
+    const duration = Number(info?.duration);
+    if (Number.isFinite(duration) && duration > (Number(stt.maxSeconds) || 120)) {
+      log(`[stt] 语音过长（${duration}s），跳过转写`);
+      return '';
+    }
+    const base64 = String(info?.base64 || '');
+    if (!base64) throw new Error('get_record 没有返回 base64（可能网关不支持 out_format）');
+    const buf = Buffer.from(base64, 'base64');
+    if (!buf.length) throw new Error('get_record 返回了空音频');
+    if (buf.length > (Number(stt.maxBytes) || 20 * 1024 * 1024)) {
+      log(`[stt] 语音文件过大（${buf.length} 字节），跳过转写`);
+      return '';
+    }
+    // 时长过滤：网关不一定给 duration，所以从 WAV 头自己算。
+    // 太短的（误触/半秒噪音）直接跳过 —— whisper 在这种片段上最容易幻觉出“字幕”“Subscribe”。
+    let audioSec = 0;
+    try { audioSec = wavDurationSec(buf); } catch {}
+    if (audioSec > 0 && audioSec < 0.5) {
+      log(`[stt] 语音过短（${audioSec.toFixed(2)}s），跳过转写`);
+      return '';
+    }
+    if (audioSec > (Number(stt.maxSeconds) || 120)) {
+      log(`[stt] 语音过长（${audioSec.toFixed(1)}s），跳过转写`);
+      return '';
+    }
+    const text = await transcribeWavBuffer(buf, {
+      binaryPath: binary,
+      modelPath: model,
+      language: String(stt.language || 'zh'),
+      threads: stt.threads,
+      timeoutMs: stt.timeoutMs
+    });
+    const clean = truncateText(String(text || '').replace(/\s+/g, ' ').trim(), 500);
+    if (!clean) { log('[stt] 语音转写完成，但没有识别出文字'); return ''; }
+    sttCache.set(ref, clean);
+    while (sttCache.size > 100) sttCache.delete(sttCache.keys().next().value);
+    log(`[stt] 语音转写完成（${clean.length} 字，用时 ${Date.now() - started}ms）`);
+    return clean;
+  }
+
+  /**
+   * 为一条消息里的语音段生成转写文本映射（段下标 → "[语音：…]"）。
+   * 串行执行，避免一条消息里多条语音同时把 CPU 打满。
+   */
+  async function transcribeIncomingVoices(segments) {
+    const stt = cfg.socialV2?.stt ?? {};
+    if (stt.enabled === false || !Array.isArray(segments)) return null;
+    const indices = [];
+    segments.forEach((seg, index) => { if (seg?.type === 'record') indices.push(index); });
+    if (!indices.length) return null;
+    const max = Math.max(1, Math.min(4, Number(stt.maxPerMessage) || 2));
+    const transcripts = new Map();
+    for (const index of indices.slice(0, max)) {
+      const job = sttQueue.then(() => transcribeOneRecord(segments[index]).catch((error) => {
+        log(`[stt] 语音转写失败：${error?.message ?? error}`);
+        return '';
+      }));
+      sttQueue = job.then(() => undefined, () => undefined);
+      const text = await job;
+      if (text) transcripts.set(index, `[语音：${text}]`);
+    }
+    return transcripts.size ? transcripts : null;
   }
 
   // ── 图片/表情字节解析（供一代自动内联与二代按需工具） ────────────────────
@@ -10526,10 +10922,13 @@ async function main() {
       return resolveGroupMemberName(event.group_id, qq);
     };
     const resolveReply = (messageId) => resolveReplyInfo(kind, id, messageId, event.self_id);
+    // 先转写语音（本地 Whisper）：转写成功时消息里的 [语音] 会变成 [语音：文字]，
+    // 让 AI 直接看到内容；失败/超时保持 [语音]，不影响正常收发。
+    const voiceTranscripts = await transcribeIncomingVoices(event.message ?? []);
     // textContent 带引用对象信息，供 DSH 判断“这句话在对谁说”；
     // plainContent 只保留当前消息自己的文字，用于命令/指向性判断，避免被引用原文干扰。
-    const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
-    const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
+    const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply, voiceTranscripts });
+    const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false, voiceTranscripts });
     const mediaList = extractMediaFromSegments(event.message ?? []);
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';

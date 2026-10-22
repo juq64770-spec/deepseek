@@ -14,7 +14,10 @@ const prefix = persona?.config?.prefix ?? '';
 test('reserved2 YAML resolves to the expected persona and template variables', () => {
   assert.equal(persona?.name, '@deepseek-ai/dsh-persona');
   assert.match(prefix, /\{\{model\}\}/);
-  assert.match(persona.config.suffix, /\{\{cwd\}\}/);
+  // DSH 0.2.0-rc.2 只注册 provider / model；写了 {{cwd}} 会让 persona 装配直接抛
+  // unknown prompt variable，整轮 agent 失败（QQ 上表现为完全不回话）。
+  const used = `${prefix}\n${persona.config.suffix ?? ''}`.match(/\{\{[a-zA-Z0-9_-]+\}\}/g) ?? [];
+  assert.deepEqual([...new Set(used)].filter((v) => !['{{model}}', '{{provider}}'].includes(v)), []);
   assert.equal(Object.hasOwn(persona.config, 'text'), false);
 });
 

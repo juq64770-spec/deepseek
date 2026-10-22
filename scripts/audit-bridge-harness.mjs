@@ -19,6 +19,10 @@ import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
+import * as diaryLib from '../src/diary-lib.js';
+import * as musicLib from '../src/music-lib.js';
+import * as sttLib from '../src/stt-lib.js';
+import * as ttsLib from '../src/tts-lib.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -30,7 +34,12 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   fs.writeFileSync(path.join(temp, 'config.json'), JSON.stringify({
     dsh: { authToken: 'fixture-only' }, ownerQQ: 123,
     allow: { private: ['123'], groups: ['456'] }, consolePort: 0,
-    consoleToken: 'fixture-console-token', slang: { enabled: false }, ...config,
+    consoleToken: 'fixture-console-token', slang: { enabled: false },
+    // 本地 Whisper 依赖本机二进制/模型：VM 测试里默认关闭，避免测试真的拉进程；
+    // 语音转写自身的 WAV/文本解析由 scripts/test-stt.mjs 覆盖。
+    // TTS 同理（edge-tts 要联网合成）：默认关闭，解析/校验由 scripts/test-tts.mjs 覆盖。
+    socialV2: { stt: { enabled: false }, tts: { enabled: false } },
+    ...config,
   }));
   if (savedState) fs.writeFileSync(path.join(temp, 'state/sessions.json'), JSON.stringify(savedState));
   // 额外状态文件（用于测试"启动时读到损坏/旧版文件"这类路径）。
@@ -161,6 +170,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
+    ...diaryLib, ...musicLib, ...sttLib, ...ttsLib,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

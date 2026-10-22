@@ -140,7 +140,10 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "sendVoice": false
+      "sendVoice": false,
+      "diary": true,
+      "nowPlaying": true,
+      "speak": false
     },
     "wake": {
       "defaultMode": "diving",
@@ -217,6 +220,31 @@
         "maxRemarkChars": 20
       }
     },
+    "diary": {
+      "enabled": true,
+      "file": "state/diary/diary.jsonl",
+      "maxChars": 300,
+      "maxPerDay": 3,
+      "recentDefault": 5,
+      "recentMax": 20
+    },
+    "music": {
+      "enabled": true,
+      "cacheTtlMs": 5000,
+      "timeoutMs": 8000
+    },
+    "stt": {
+      "enabled": true,
+      "binaryPath": "tools/whisper/Release/whisper-cli.exe",
+      "modelPath": "tools/whisper/models/ggml-small.bin",
+      "language": "zh",
+      "threads": 4,
+      "timeoutMs": 60000,
+      "maxSeconds": 120,
+      "maxBytes": 20971520,
+      "maxPerMessage": 2,
+      "maxPerMinute": 4
+    },
     "voice": {
       "enabled": false,
       "dir": "audio",
@@ -255,6 +283,17 @@
       "maxBytes": 8388608,
       "maxPixels": 64000000,
       "maxCount": 5
+    },
+    "tts": {
+      "enabled": false,
+      "voice": "zh-CN-XiaoyiNeural",
+      "rate": "+0%",
+      "volume": "+0%",
+      "pitch": "+0Hz",
+      "edgeTtsCmd": "edge-tts",
+      "proxy": "",
+      "maxChars": 200,
+      "timeoutMs": 60000
     }
   },
   "webSearch": {
